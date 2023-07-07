@@ -1,0 +1,501 @@
+#!/bin/python3
+"""
+A server to receive http requests representing events from a XOVIS sensor.
+"""
+
+# Import the required modules
+## Flask
+import os
+from typing import Any, Dict, List, Type
+import flask
+import json
+from json.decoder import JSONDecodeError
+import time
+from homeassistant_api import Client, Domain, Service, State
+import re
+
+ALLOWED_HOSTS: List[str] = [
+    '192.168.0.250'
+]
+
+PORT  = 1080
+COUNT = 1
+
+def get_local_ip() -> str:
+    # Get the local IP (LAN)
+    ## Get Output of `ip a`
+    ip_a = os.popen('ip a').read()
+    ## LAN: enpXXsX or wlpXXsX
+    ## Get the interface from the format above. The line should NOT contain 'state DOWN'
+    ## Use re to find above pattern
+    mat = re.search(r'(enp|wlp)[0-9]{2}s[0-9]', ip_a)
+    if mat is None:
+        INTERFACE = 'lo'
+        start = 0
+    else:
+        INTERFACE = mat.group(0)
+        start = mat.start(0)
+        
+    # Get the IP
+    mat = re.search(r'inet ((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}', ip_a[start:])
+    if mat is None:
+        raise Exception('Could not find local IP')
+    else:
+        return mat.group(0).split(' ')[1]
+
+LOCAL_IP = get_local_ip()
+
+print('Local IP: ' + LOCAL_IP)
+
+class Level:
+    DEBUG = 0
+    INFO = 1
+    WARNING = 2
+    ERROR = 3
+    CRITICAL = 4
+    
+    REPRS = [
+        'DEBUG',
+        'INFO',
+        'WARNING',
+        'ERROR',
+        'CRITICAL'
+    ]
+    
+    @staticmethod
+    def is_level(level: str|int) -> bool:
+        if isinstance(level, str):
+            return level.upper() in Level.REPRS
+        else:
+            return level >= Level.DEBUG and level <= Level.CRITICAL
+    
+    @staticmethod
+    def get_level(level: str|int) -> int:
+        if isinstance(level, str):
+            if not level.upper() in Level.REPRS:
+                raise ValueError(f'Invalid log level: {level}')
+            return Level.REPRS.index(level.upper())
+        else:
+            if not Level.is_level(level):
+                raise ValueError(f'Invalid log level: {level}')
+            return level
+        
+    @staticmethod
+    def get_repr(level: int|str) -> str:
+        if not Level.is_level(level):
+            raise ValueError(f'Invalid log level: {level}')
+        return Level.REPRS[
+            Level.get_level(level)
+        ]
+
+# Logging
+class Log:
+    nline: bool = True
+    path: str
+    level: int = Level.INFO
+    echo_level: int = Level.WARNING
+    
+    def __init__(self, level: str|int=Level.INFO, echo_level: str|int=Level.WARNING, rel_path='xovisd.log') -> None:
+        """
+        Create a new log.
+        """
+        # cwd + rel_path
+        self.path = os.path.join(os.getcwd(), rel_path)
+        self.level = Level.get_level(level)
+        self.echo_level = Level.get_level(echo_level)
+        
+    def __call__(self, *args, end: str='\n', level: int|str=1) -> Any:
+        """
+        Log a text to the console.
+        """
+        if not Level.is_level(level):
+            raise ValueError(f'Invalid log level: {level}')
+        
+        if Level.get_level(level) < self.level:
+            return
+        
+        with open(self.path, 'a+') as f:
+            text = ' '.join([
+                "\n\t".join(str(t).split('\n')) for t in args
+            ])
+            
+            # If not, prefix = '' otherwise prefix = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            if not self.nline:
+                prefix = ''
+                NLINE = True
+            else:
+                prefix_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                prefix_level = f'[{Level.get_repr(level)}]\t'
+                prefix = f'{prefix_time} {prefix_level}'
+                
+            if end != '\n':
+                NLINE = False
+            
+            line = f'{prefix} {text}' + end
+            # Write the text
+            f.write(
+                line
+            )
+            
+            if Level.get_level(level) >= self.echo_level:
+                print(line, end='')
+
+log = Log(Level.DEBUG)    
+
+log('Starting Xovisd...')
+
+# Light
+# Parse string to time
+class TimeWindow:
+    start: int
+    end: int
+    
+    def __init__(self, source: Dict[str, str]) -> None:
+        """
+        Create a new time window from a dict.
+        """
+        
+        self.start = TimeWindow.parse(source['start'])
+        self.end = TimeWindow.parse(source['end'])
+    
+    @staticmethod
+    def parse(time_s: str) -> int:
+        """
+        Parse a time string into seconds.
+        """
+        return int(time_s.split(':')[0]) * 3600 + int(time_s.split(':')[1]) * 60
+    
+    def __str__(self) -> str:
+        """
+        Convert the time window to a string.
+        """
+        return f'TimeWindow(start={self.start}, end={self.end})'
+    
+    def str_start(self) -> str:
+        """
+        Convert the start time to a string.
+        """
+        return f'{self.start // 3600:02d}:{(self.start % 3600) // 60:02d}'
+    
+    def str_end(self) -> str:
+        """
+        Convert the end time to a string.
+        """
+        return f'{self.end // 3600:02d}:{(self.end % 3600) // 60:02d}'
+    
+    def within(self, time: int | float | Type['TimeWindow']) -> bool:
+        """
+        Check if a time is within the time window.
+        """
+        if isinstance(time, TimeWindow):
+            return self.within(time=time.start) or self.within(time=time.end)
+        elif isinstance(time, float) or isinstance(time, int):
+            time = time % 86400
+            return self.start <= time <= self.end
+        
+        raise TypeError(f'Expected time to be of type int, float or TimeWindow, got {type(time)}')
+    
+    def now(self) -> bool:
+        """
+        Check if the current time is within the time window.
+        """
+        return self.within(
+            time=time.time()
+        )
+
+class Light:
+    id: str
+    name: str
+    on_times: List[TimeWindow]
+    restore_timeout: int
+    disable_on_leave: bool
+    timer: float
+    api: State | None = None
+    
+    def __init__(self, id, **source) -> None:
+        """
+        Create a new config from a dict.
+        """
+        
+        self.id = id
+        self.name = source['name'] if 'name' in source else id
+        self.on_times = [TimeWindow(tw) for tw in source['on_times']] if 'on_times' in source else []
+        self.restore_timeout = source['restore_timeout'] if 'restore_timeout' in source else 1800
+        self.disable_on_leave = source['disable_on_leave'] if 'disable_on_leave' in source else False
+        self.timer = time.time()
+        
+    def __str__(self) -> str:
+        """
+        Convert the config to a string.
+        """
+        return f'Light(name={self.name}, on_times={self.on_times}, restore_timeout={self.restore_timeout}, turn_off_leave={self.disable_on_leave})'
+    
+    def json(self) -> Dict[str, Any]:
+        """
+        Convert the config to a dict.
+        """
+        return {
+            'name': self.name,
+            'on_times': [
+                {
+                    'start': tw.str_start(),
+                    'end': tw.str_end()
+                } for tw in self.on_times
+            ],
+            'restore_timeout': self.restore_timeout,
+            'disable_on_leave': self.disable_on_leave
+        }
+        
+    def active(self) -> bool:
+        """
+        Check if the config is active.
+        """
+        return any([tw.now() for tw in self.on_times]) or (
+            self.disable_on_leave and
+            time.time() - self.timer < self.restore_timeout
+        )
+        
+    def is_on(self) -> bool:
+        """
+        Check if the light is on.
+        """
+        if isinstance(self.api, State):
+            return self.api.state == 'on'
+        return False
+        
+    def reset_timer(self) -> None:
+        """
+        Reset the timer.
+        """
+        self.timer = time.time()
+        
+    def apply(self, func: Service | None) -> None:
+        """
+        Turn on the light.
+        """
+        # Turn on the light
+        service_raw = func
+        if isinstance(service_raw, Service):
+            service: Service = service_raw
+            service(entity_id=self.id)
+            log(f'Turned on light {self.id}', level=Level.DEBUG)
+        else:
+            log(f'Could not turn on light {self.id}', level=Level.WARNING)
+
+def load_conf(rel_path: str='config.json') -> 'Config':
+    # Check if the config exists
+    try:
+        log(f'Using existing config: {os.getcwd()}/{rel_path}', level=Level.DEBUG)
+        with open(rel_path, 'r+') as f:
+            conf = json.load(f)
+    except (FileNotFoundError, JSONDecodeError):
+        log(f'Creating new config: {os.getcwd()}/{rel_path}', level=Level.DEBUG)
+        with open(rel_path, 'w+') as f:
+            json.dump(Config().json(), f, indent=4)
+        with open(rel_path, 'r+') as f:
+            conf = json.load(f)
+    
+    log(f'Loaded Light: \n{json.dumps(conf, indent=4)}', level=Level.DEBUG)
+    
+    try:
+        return Config(**conf, path=rel_path)
+    except Exception as e:
+        log(f'Failed to load config: {e}', level=Level.ERROR)
+        raise e
+
+def save_config(conf: 'Config') -> None:
+    """
+    Save the config to a file.
+    """
+    
+    # Save the config
+    with open('config.json', 'w+') as f:
+        json.dump(
+            conf.json(),
+            f,
+            indent=4
+        )
+
+def update_conf(lights: List[State], conf: 'Config') -> 'Config':
+    """
+    Update the config with new lights.
+    """
+    
+    # Add new lights
+    for light in lights:
+        if light.entity_id not in conf.lights:
+            log(f'Adding new light {light.entity_id}', level=Level.INFO)
+            
+            conf.lights[light.entity_id] = Light(
+                light.entity_id,
+                name=light.attributes['friendly_name']
+            )
+            
+        conf.lights[light.entity_id].api = light
+        
+    return conf
+
+class Config:
+    lights: Dict[str, Light]
+    api_port: int
+    hass_url: str
+    hass_secret: str
+    path: str = 'config.json'
+    
+    def __init__(self, path: str='config.json', **source) -> None:
+        """
+        Create a new config from a dict.
+        """
+        
+        self.lights = {
+            id: Light(id, **light) for id, light in source['lights'].items()
+        } if 'lights' in source else {}
+        self.api_port = source['api']['port'] if 'api' in source and 'port' in source['api'] else 8080
+        self.hass_url = source['hass']['host'] if 'hass' in source and 'host' in source['hass'] else 'http://localhost:8123'
+        self.hass_secret = source['hass']['secret'] if 'hass' in source and 'secret' in source['hass'] else ''
+        
+        self.path = path
+        
+    @classmethod
+    def load(cls, rel_path: str='config.json') -> 'Config':
+        """
+        Load the config from a file.
+        """
+        return load_conf(rel_path=rel_path)
+    
+    def save(self) -> None:
+        """
+        Save the config to a file.
+        """
+        save_config(self)
+        
+    def update(self, lights: List[State]) -> None:
+        """
+        Update the config with new lights.
+        """
+        update_conf(lights, self)
+        
+    def __str__(self) -> str:
+        """
+        Convert the config to a string.
+        """
+        return f'Config(lights={self.lights}, api_port={self.api_port}, hass_url={self.hass_url}, hass_secret={self.hass_secret})'
+    
+    def json(self) -> Dict[str, Any]:
+        """
+        Convert the config to a dict.
+        """
+        return {
+            'hass': {
+                'host': self.hass_url,
+                'secret': self.hass_secret
+            },
+            'api': {
+                'port': self.api_port
+            },
+            'lights': {
+                id: light.json() for id, light in self.lights.items()
+            },
+        }
+
+CONFIG = Config.load()
+
+if not CONFIG.hass_secret:
+    log('No hass secret specified, please specify', level=Level.ERROR)
+    exit(1)
+
+# Client/API setup
+client = Client(
+    CONFIG.hass_url,
+    CONFIG.hass_secret
+)
+
+app = flask.Flask(__name__)
+
+# Get lights
+LIGHTS_RAW = client.get_domain("light")
+if isinstance(LIGHTS_RAW, Domain):
+    LIGHTS_DOMAIN: Domain = LIGHTS_RAW
+else:
+    raise Exception("Could not get lights domain")
+
+STATES = client.get_states()
+LIGHTS_STATES = [state for state in STATES if state.entity_id.startswith("light")]
+
+CONFIG = update_conf(LIGHTS_STATES, CONFIG)
+
+save_config(CONFIG)
+
+class Sensor:
+    @staticmethod
+    def parse_json(json_b: bytes) -> List[Dict[str, str]]:
+        """
+        Parse a JSON object into a string.
+        """
+        
+        # Decode the JSON
+        json_s = json_b.decode('utf-8')
+        # Parse the JSON
+        json_o = json.loads(json_s)
+        return json_o
+
+    @staticmethod
+    def direct(json_o: Dict[str, str]) -> int:
+        """
+        Get the direction of the event.
+        """
+        return -1 if json_o['direction'] == 'forward' else 1
+
+# Link the / endpoint to print the request
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    global COUNT, TIMER
+    json = Sensor.parse_json(flask.request.data)
+    
+    # Check if the host is allowed
+    if flask.request.remote_addr not in ALLOWED_HOSTS:
+        log(f'Unauthorized request from {flask.request.remote_addr}', level=Level.WARNING)
+        return 'Unauthorized', 401
+    
+    for event in json:
+        if event['type'] != 'LineCrossing':
+            continue
+        
+        log(f'Received request from {flask.request.remote_addr}', level=Level.DEBUG)
+        
+        COUNT += Sensor.direct(event)
+        
+        if Sensor.direct(event) == 1:
+            log(f'Person entered the room.', level=Level.INFO)
+        else:
+            log(f'Person left the room.', level=Level.INFO)
+        
+        if COUNT < 0:
+            log('Person count was negative, resetting to 0.', level=Level.WARNING)
+            COUNT = 0
+        elif COUNT == 0:
+            log('No one is in the room.', level=Level.INFO)
+            for id, light in CONFIG.lights.items():
+                if light.disable_on_leave and light.is_on():
+                    light.apply(LIGHTS_DOMAIN.turn_off)
+                    light.reset_timer()
+        else:
+            log(
+                f'{COUNT} people are in the room.' if COUNT > 1 else
+                f'{COUNT} person is in the room.',
+                level=Level.INFO
+            )
+            for id, light in CONFIG.lights.items():
+                if light.active():
+                    light.apply(LIGHTS_DOMAIN.turn_on)
+        
+    return flask.Response(status=200)
+
+if __name__ == '__main__':    
+    # Run the app
+    log(f'Running app on port {PORT}', level=Level.INFO)
+    try:
+        app.run(host=LOCAL_IP, port=PORT)
+    except Exception as e:
+        log(f'Failed to run app: {e}', level=Level.ERROR)
+        raise e

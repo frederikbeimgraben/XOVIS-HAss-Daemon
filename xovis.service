@@ -1,0 +1,16 @@
+# Service for `/bin/xovisd`
+# ========================
+[Unit]
+Description=Service for xovisd
+After=network.target
+
+[Service]
+Type=simple
+User=frederikb
+Group=frederikb
+WorkingDirectory=/home/frederikb/XOVIS/service
+ExecStart=/bin/xovisd
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
